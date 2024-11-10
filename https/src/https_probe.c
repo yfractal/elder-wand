@@ -35,23 +35,7 @@ int initialize_http_fds_once() {
     return 0;
 }
 
-// for SSL_read
-static int Real__SSL_read(void *ssl, void *buf, int num) { return SSL_read (ssl, buf, num); }
-extern int __interpose_SSL_read(void *ssl, void *buf, int num);
-
-static const struct __osx_interpose __osx_interpose_SSL_read __attribute__((used, section("__DATA, __interpose"))) =
-  { (const void*)((uintptr_t)(&(__interpose_SSL_read))),
-    (const void*)((uintptr_t)(&(SSL_read))) };
-
-// for read
-static ssize_t Real__read(int socket, void *buffer, size_t length) { return read(socket, buffer, length); }
-extern ssize_t __interpose_read(int, void *, size_t);
-
-static const struct __osx_interpose __osx_interpose_read __attribute__((used, section("__DATA, __interpose"))) =
-  { (const void*)((uintptr_t)(&(__interpose_read))),
-    (const void*)((uintptr_t)(&(read))) };
-
-// socket
+// socket open and socket close
 static int Real__socket(int domain, int type, int protocol) { return socket(domain, type, protocol); }
 extern int __interpose_socket(int domain, int type, int protocol);
 
@@ -59,13 +43,29 @@ static const struct __osx_interpose __osx_interpose_socket __attribute__((used, 
   { (const void*)((uintptr_t)(&(__interpose_socket))),
     (const void*)((uintptr_t)(&(socket))) };
 
-// close
 static int Real__close(int fd) { return close(fd); }
 extern int __interpose_close(int fd);
 
 static const struct __osx_interpose __osx_interpose_close __attribute__((used, section("__DATA, __interpose"))) =
   { (const void*)((uintptr_t)(&(__interpose_close))),
     (const void*)((uintptr_t)(&(close))) };
+
+
+// SSL_read for https
+static int Real__SSL_read(void *ssl, void *buf, int num) { return SSL_read (ssl, buf, num); }
+extern int __interpose_SSL_read(void *ssl, void *buf, int num);
+
+static const struct __osx_interpose __osx_interpose_SSL_read __attribute__((used, section("__DATA, __interpose"))) =
+  { (const void*)((uintptr_t)(&(__interpose_SSL_read))),
+    (const void*)((uintptr_t)(&(SSL_read))) };
+
+// read for http
+// static ssize_t Real__read(int socket, void *buffer, size_t length) { return read(socket, buffer, length); }
+// extern ssize_t __interpose_read(int, void *, size_t);
+
+// static const struct __osx_interpose __osx_interpose_read __attribute__((used, section("__DATA, __interpose"))) =
+//   { (const void*)((uintptr_t)(&(__interpose_read))),
+//     (const void*)((uintptr_t)(&(read))) };
 
 const unsigned char *skip_crlf(const unsigned char *body) {
     assert(strncmp((const char *)body, "\r\n", 2) == 0);
@@ -89,7 +89,7 @@ int read_chunk_size(const unsigned char *body, const unsigned char **rest) {
 }
 
 // Read the chunked HTTP body
-unsigned char *read_chunked_http_body(const unsigned char *body, size_t body_len, size_t *out_len) {
+int read_chunked_http_body(const unsigned char *body, size_t body_len, size_t *out_len, unsigned char **result_body) {
     unsigned char *decoded_body = NULL;
     size_t decoded_size = 0;
 
@@ -106,16 +106,17 @@ unsigned char *read_chunked_http_body(const unsigned char *body, size_t body_len
 
         // Ensure we have enough data for the chunk
         if (body_len < chunk_size) {
-            fprintf(stderr, "Insufficient data for chunk\n");
+            fprintf(stderr, "Insufficient data for chunk, needs = %zu\n", chunk_size - body_len);
             free(decoded_body);
-            return NULL;
+            return 0;
         }
 
         // Allocate or reallocate buffer for decoded data
         decoded_body = realloc(decoded_body, decoded_size + chunk_size);
+        *result_body = decoded_body;
         if (decoded_body == NULL) {
             fprintf(stderr, "Failed to allocate memory\n");
-            return NULL;
+            return -1;
         }
 
         memcpy(decoded_body + decoded_size, body, chunk_size);
@@ -127,15 +128,16 @@ unsigned char *read_chunked_http_body(const unsigned char *body, size_t body_len
         if (body_len < 2 || strncmp((const char *)body, "\r\n", 2) != 0) {
             fprintf(stderr, "Missing CRLF after chunk\n");
             free(decoded_body);
-            return NULL;
+            return -2;
         }
         body = skip_crlf(body);
         body_len -= 2;
     }
 
     *out_len = decoded_size;
+    *result_body = decoded_body;
 
-    return decoded_body;
+    return 0;
 }
 
 int http_body_offset(const char* http_str) {
@@ -178,56 +180,67 @@ int decompress_gzip(const unsigned char *compressed_data, size_t compressed_data
 }
 
 void print_buffer(const char* buff, size_t len) {
+    printf("[print_buffer] Buffer:\n");
     for (size_t i = 0; i < len; i++) {
         printf("%c", buff[i]);
     }
+    printf("\n");
 }
 
 extern int __interpose_SSL_read (void *ssl, void *buf, int num) {
   int ret = Real__SSL_read(ssl, buf, num);
+  printf("[debug] SSL ret %d\n", ret);
   char* headers = NULL;
   char* raw_body = NULL;
 
   if (ret > 0) {
     int body_offset = http_body_offset(buf);
 
+    if (body_offset == -1) {
+        printf("not http body: %p\n", ssl);
+        return ret;
+    }
+
+    // print http header
     print_buffer(buf, body_offset - 1);
 
     size_t decoded_len;
-    unsigned char *decoded_body = read_chunked_http_body((const unsigned char *)(buf + body_offset), ret - body_offset, &decoded_len);
+    size_t body_len = ret - body_offset;
+    unsigned char *body;
+    int result = read_chunked_http_body((const unsigned char *)(buf + body_offset), body_len, &decoded_len, &body);
 
-    if (decoded_body != NULL) {
-      // Buffer for the decompressed output
-      // TODO: Make sure it's large enough for decompressed data
-      size_t alloated_size = 16384;
-      unsigned char decompressed_output[alloated_size];
-      size_t output_len = alloated_size;
+    // if (decoded_body != NULL) {
+    //   // Buffer for the decompressed output
+    //   // TODO: Make sure it's large enough for decompressed data
+    //   size_t alloated_size = 16384;
+    //   unsigned char decompressed_output[alloated_size];
+    //   size_t output_len = alloated_size;
 
-      int ret = decompress_gzip(decoded_body, ret - body_offset, decompressed_output, output_len);
-      assert(output_len <= alloated_size);
+    //   int ret = decompress_gzip(decoded_body, ret - body_offset, decompressed_output, output_len);
+    //   assert(output_len <= alloated_size);
 
-      if (ret == Z_OK) {
-          printf("\n\n%s\n", decompressed_output);
-      } else {
-          printf("Decompression failed with error code: %d\n", ret);
-      }
+    //   if (ret == Z_OK) {
+    //       printf("\n\n%s\n", decompressed_output);
+    //   } else {
+    //       printf("Decompression failed with error code: %d\n", ret);
+    //   }
 
-      free(decoded_body);
-    }
+    //   free(decoded_body);
+    // }
   }
 
   return ret;
 }
 
-extern ssize_t __interpose_read(int socket, void *buffer, size_t length) {
-    ssize_t ret = Real__read(socket, buffer, length);
-    if (ret > 0 && HTTP_FDS != NULL && HTTP_FDS[socket] == 1) {
-        print_buffer(buffer, ret);
-        printf("\n\n");
-    }
+// extern ssize_t __interpose_read(int socket, void *buffer, size_t length) {
+//     ssize_t ret = Real__read(socket, buffer, length);
+//     if (ret > 0 && HTTP_FDS != NULL && HTTP_FDS[socket] == 1) {
+//         print_buffer(buffer, ret);
+//         printf("\n\n");
+//     }
 
-    return ret;
-}
+//     return ret;
+// }
 
 extern int __interpose_socket(int domain, int type, int protocol) {
     int ret = Real__socket(domain, type, protocol);
