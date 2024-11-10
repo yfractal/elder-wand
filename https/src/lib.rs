@@ -129,18 +129,13 @@ fn http_body_offset(http_str: &[u8]) -> i32 {
 }
 
 fn print_buffer(buff: *const c_char, len: usize) {
-    // Convert C-style string to Rust string
-    unsafe {
-        // Make sure the pointer is valid and the length is correct
-        let c_str = CStr::from_ptr(buff);
-        let str_slice = c_str.to_str().unwrap_or("");
+    let mut i = 0;
+    let bytes = unsafe { CStr::from_ptr(buff).to_bytes() };
 
-        println!("[print_buffer] Buffer:");
-        for (_, c) in str_slice.chars().take(len).enumerate() {
-            print!("{}", c);
-        }
-
-        println!();
+    println!("[print_buffer] Buffer: len={}", len);
+    while i < len {
+        print!("{}", bytes[i] as char);
+        i += 1;
     }
 }
 
