@@ -104,20 +104,29 @@ int read_chunked_http_body(const unsigned char *body, size_t body_len, size_t *o
             break;
         }
 
-        // Ensure we have enough data for the chunk
+        // uncomplete chunk
         if (body_len < chunk_size) {
             fprintf(stderr, "Insufficient data for chunk, needs = %zu\n", chunk_size - body_len);
-            free(decoded_body);
-            return 0;
+            decoded_body = realloc(decoded_body, decoded_size + body_len);
+            if (decoded_body == NULL) {
+                fprintf(stderr, "Failed to allocate memory\n");
+                return -1;
+            }
+            *result_body = decoded_body;
+            // append remain
+            memcpy(decoded_body + decoded_size, body, body_len);
+            decoded_size += body_len;
+
+            return chunk_size - body_len;
         }
 
         // Allocate or reallocate buffer for decoded data
         decoded_body = realloc(decoded_body, decoded_size + chunk_size);
-        *result_body = decoded_body;
         if (decoded_body == NULL) {
             fprintf(stderr, "Failed to allocate memory\n");
             return -1;
         }
+        *result_body = decoded_body;
 
         memcpy(decoded_body + decoded_size, body, chunk_size);
         decoded_size += chunk_size;
