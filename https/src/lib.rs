@@ -151,9 +151,8 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     // get remain body
-
+    println!("body={:?},len={}", body, body.len());
     decoded_body.extend_from_slice(&body);
-    println!("decoded_body={:?}", decoded_body);
 
     Ok(decoded_body)
 }
@@ -174,20 +173,15 @@ fn http_body_offset(http_str: &[u8]) -> i32 {
     }
 }
 
-fn print_buffer(buff: &[u8], len: usize) {
-    let mut i = 0;
-    println!("[print_buffer] Buffer: len={}", len);
-
-    while i < len {
-        print!("{}", buff[i] as char);
-        i += 1;
-    }
+fn print_bytes(buff: &[u8]) {
+    let str = std::str::from_utf8(buff).unwrap();
+    println!("{}", str);
 }
 
 #[no_mangle]
 pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: i32) -> i32 {
     let ret = real_ssl_read(ssl, buf, num);
-    println!("length ={}", ret);
+    println!("SSL_read length ={}", ret);
     if ret > 0 {
         let buf_slice: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
 
@@ -195,6 +189,7 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
             let mut map = GLOBAL_HASHMAP.lock().unwrap();
             let mut buffer = map.get(&(ssl as usize)).unwrap().to_vec();
             buffer.extend(buf_slice);
+            println!("buffer.len={}", buffer.len());
             map.remove(&(ssl as usize));
 
             let body_offset = http_body_offset(&buffer);
@@ -203,6 +198,9 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
                 println!("Not HTTP body: {:?}", ssl);
                 return ret;
             }
+
+            let header = &buffer[0..body_offset as usize - 1];
+            print_bytes(header);
 
             println!("body_offset={}", body_offset);
 
@@ -215,9 +213,8 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
                             return ret;
                         }
                     };
-                    println!("decompressed_output ={:?}", decompressed_output);
+                    print_bytes(&decompressed_output);
 
-                    print_buffer(&decompressed_output, decompressed_output.len());
                     return ret;
                 }
                 Err(_) => {
