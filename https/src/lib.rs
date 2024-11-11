@@ -81,8 +81,10 @@ fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
     };
 
     println!(
-        "[debug][read_chunk_size] chunk_size={:?}, chunk_pos={:?}",
-        chunk_size, chunk_pos
+        "[debug][read_chunk_size] chunk_size={:?}, chunk_pos={:?}, body.len={:?}",
+        chunk_size,
+        chunk_pos,
+        body.len()
     );
 
     // Skip the CRLF after the chunk size
@@ -102,14 +104,15 @@ fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
 }
 
 fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
+    println!("[read_chunked_http_body] enter");
     let mut decoded_body = Vec::new();
     let mut body_len = body.len();
     let mut body = body;
+    println!("body={:?}\n", body);
 
     while body_len > 0 {
         let (chunk_size, rest) = read_chunk_size(body);
-        println!("[debug][read_chunked_http_body] body={:?}", body);
-        println!("[debug][read_chunked_http_body] rest={:?}", rest);
+        println!("[read_chunked_http_body] chunk_size={}...", chunk_size);
 
         body = rest;
         body_len = rest.len();
@@ -120,7 +123,7 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
 
         if body_len < chunk_size {
             println!(
-                "[debug][read_chunked_http_body] remain={:?}, chunk_size=#{:?}, body_len={:?}",
+                "[debug][read_chunked_http_body] not enough, remain={:?}, chunk_size=#{:?}, body_len={:?}",
                 chunk_size - body_len,
                 chunk_size,
                 body_len
@@ -131,6 +134,7 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
 
         decoded_body.extend_from_slice(&body[..chunk_size]);
         body = &body[chunk_size..];
+
         body_len -= chunk_size;
 
         if body_len < 2 || &body[0..2] != b"\r\n" {
@@ -142,17 +146,24 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
         }
         println!("[debug] body={:?}", body);
         body = skip_crlf(body);
+
         body_len -= 2;
     }
+
+    // get remain body
+
+    decoded_body.extend_from_slice(&body);
+    println!("decoded_body={:?}", decoded_body);
 
     Ok(decoded_body)
 }
 
-fn decompress_gzip(compressed_data: &[u8], output_len: usize) -> io::Result<Vec<u8>> {
+fn decompress_gzip(compressed_data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decoder = GzDecoder::new(compressed_data);
-    let mut output = vec![0; output_len];
-    decoder.read_exact(&mut output)?;
-    Ok(output)
+    let mut decompressed_data = Vec::new();
+    decoder.read_to_end(&mut decompressed_data)?;
+
+    Ok(decompressed_data)
 }
 
 fn http_body_offset(http_str: &[u8]) -> i32 {
@@ -176,10 +187,9 @@ fn print_buffer(buff: &[u8], len: usize) {
 #[no_mangle]
 pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: i32) -> i32 {
     let ret = real_ssl_read(ssl, buf, num);
-
+    println!("length ={}", ret);
     if ret > 0 {
         let buf_slice: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
-        println!("length ={}", buf_slice.len());
 
         if buf_slice.ends_with(b"0\r\n\r\n") {
             let mut map = GLOBAL_HASHMAP.lock().unwrap();
@@ -196,17 +206,16 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
 
             println!("body_offset={}", body_offset);
 
-            print_buffer(&buffer, (body_offset - 1) as usize);
-
             match read_chunked_http_body(&buffer[body_offset as usize..]) {
                 Ok(body) => {
-                    let decompressed_output = match decompress_gzip(&body, body.len()) {
+                    let decompressed_output = match decompress_gzip(&body) {
                         Ok(output) => output,
                         Err(e) => {
                             eprintln!("Decompression error: {}", e);
                             return ret;
                         }
                     };
+                    println!("decompressed_output ={:?}", decompressed_output);
 
                     print_buffer(&decompressed_output, decompressed_output.len());
                     return ret;
