@@ -1,8 +1,17 @@
+#[macro_use]
+extern crate lazy_static;
+
 use flate2::read::GzDecoder;
-use libc::{c_char, c_int, socket};
-use std::ffi::{c_void, CStr};
+use libc::{c_int, socket};
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::io::{self, Read};
 use std::slice;
+use std::sync::Mutex;
+
+lazy_static! {
+    static ref GLOBAL_HASHMAP: Mutex<HashMap<usize, Vec<u8>>> = Mutex::new(HashMap::new());
+}
 
 extern "C" {
     fn SSL_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
@@ -154,13 +163,12 @@ fn http_body_offset(http_str: &[u8]) -> i32 {
     }
 }
 
-fn print_buffer(buff: *const c_char, len: usize) {
+fn print_buffer(buff: &[u8], len: usize) {
     let mut i = 0;
-    let bytes = unsafe { CStr::from_ptr(buff).to_bytes() };
-
     println!("[print_buffer] Buffer: len={}", len);
+
     while i < len {
-        print!("{}", bytes[i] as char);
+        print!("{}", buff[i] as char);
         i += 1;
     }
 }
@@ -168,22 +176,57 @@ fn print_buffer(buff: *const c_char, len: usize) {
 #[no_mangle]
 pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: i32) -> i32 {
     let ret = real_ssl_read(ssl, buf, num);
-    println!("[debug] SSL ret {}", ret);
-
-    let buf_slice: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
 
     if ret > 0 {
-        let body_offset = http_body_offset(buf_slice);
-        println!("body_offset: {:?}", body_offset);
+        let buf_slice: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
+        println!("length ={}", buf_slice.len());
 
-        if body_offset == -1 {
-            println!("Not HTTP body: {:?}", ssl);
-            return ret;
+        if buf_slice.ends_with(b"0\r\n\r\n") {
+            let mut map = GLOBAL_HASHMAP.lock().unwrap();
+            let mut buffer = map.get(&(ssl as usize)).unwrap().to_vec();
+            buffer.extend(buf_slice);
+            map.remove(&(ssl as usize));
+
+            let body_offset = http_body_offset(&buffer);
+
+            if body_offset == -1 {
+                println!("Not HTTP body: {:?}", ssl);
+                return ret;
+            }
+
+            println!("body_offset={}", body_offset);
+
+            print_buffer(&buffer, (body_offset - 1) as usize);
+
+            match read_chunked_http_body(&buffer[body_offset as usize..]) {
+                Ok(body) => {
+                    let decompressed_output = match decompress_gzip(&body, body.len()) {
+                        Ok(output) => output,
+                        Err(e) => {
+                            eprintln!("Decompression error: {}", e);
+                            return ret;
+                        }
+                    };
+
+                    print_buffer(&decompressed_output, decompressed_output.len());
+                    return ret;
+                }
+                Err(_) => {
+                    return ret;
+                }
+            }
+        } else {
+            let mut map = GLOBAL_HASHMAP.lock().unwrap();
+            if map.contains_key(&(ssl as usize)) {
+                let mut buffer = map.get(&(ssl as usize)).unwrap().to_vec();
+                buffer.extend(buf_slice);
+                map.insert(ssl as usize, buffer);
+            } else {
+                map.insert(ssl as usize, buf_slice.to_vec());
+            }
+
+            println!("not ended");
         }
-
-        print_buffer(buf as *const c_char, (body_offset - 1) as usize);
-
-        let _ = read_chunked_http_body(&buf_slice[body_offset as usize..]);
     }
 
     ret
