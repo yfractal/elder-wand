@@ -49,11 +49,6 @@ fn real_ssl_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn __interpose_socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int {
-    println!(
-        "Interposed socket function called with domain: {}, type: {}, protocol: {}",
-        domain, type_, protocol
-    );
-
     let ret = real_socket(domain, type_, protocol);
 
     ret
@@ -80,13 +75,6 @@ fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
         Err(_) => return (0, body), // UTF-8 conversion failed, return 0 size
     };
 
-    println!(
-        "[debug][read_chunk_size] chunk_size={:?}, chunk_pos={:?}, body.len={:?}",
-        chunk_size,
-        chunk_pos,
-        body.len()
-    );
-
     // Skip the CRLF after the chunk size
     let end_of_size = body
         .windows(2) // Iterate over windows of 2 bytes
@@ -95,7 +83,6 @@ fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
 
     match end_of_size {
         Some(slice) => {
-            println!("end_of_size");
             let rest = skip_crlf(&slice);
             return (chunk_size, rest);
         }
@@ -104,15 +91,12 @@ fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
 }
 
 fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
-    println!("[read_chunked_http_body] enter");
     let mut decoded_body = Vec::new();
     let mut body_len = body.len();
     let mut body = body;
-    println!("body={:?}\n", body);
 
     while body_len > 0 {
         let (chunk_size, rest) = read_chunk_size(body);
-        println!("[read_chunked_http_body] chunk_size={}...", chunk_size);
 
         body = rest;
         body_len = rest.len();
@@ -138,22 +122,19 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
         body_len -= chunk_size;
 
         if body_len < 2 || &body[0..2] != b"\r\n" {
-            println!("[debug] Remain body_len < 2");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Missing CRLF after chunk",
             ));
         }
-        println!("[debug] body={:?}", body);
+
         body = skip_crlf(body);
 
         body_len -= 2;
     }
 
     // get remain body
-    println!("body={:?},len={}", body, body.len());
     decoded_body.extend_from_slice(&body);
-
     Ok(decoded_body)
 }
 
@@ -181,7 +162,7 @@ fn print_bytes(buff: &[u8]) {
 #[no_mangle]
 pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: i32) -> i32 {
     let ret = real_ssl_read(ssl, buf, num);
-    println!("SSL_read length ={}", ret);
+
     if ret > 0 {
         let buf_slice: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
 
@@ -189,7 +170,6 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
             let mut map = GLOBAL_HASHMAP.lock().unwrap();
             let mut buffer = map.get(&(ssl as usize)).unwrap().to_vec();
             buffer.extend(buf_slice);
-            println!("buffer.len={}", buffer.len());
             map.remove(&(ssl as usize));
 
             let body_offset = http_body_offset(&buffer);
@@ -201,8 +181,6 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
 
             let header = &buffer[0..body_offset as usize - 1];
             print_bytes(header);
-
-            println!("body_offset={}", body_offset);
 
             match read_chunked_http_body(&buffer[body_offset as usize..]) {
                 Ok(body) => {
@@ -230,8 +208,6 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
             } else {
                 map.insert(ssl as usize, buf_slice.to_vec());
             }
-
-            println!("not ended");
         }
     }
 
