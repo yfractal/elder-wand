@@ -51,19 +51,19 @@ pub extern "C" fn __interpose_socket(domain: c_int, type_: c_int, protocol: c_in
 }
 
 fn skip_crlf(body: &[u8]) -> &[u8] {
-    assert_eq!(&body[0..2], b"\r\n");
+    assert_eq!(&body[0..2], b"\r\n"); // b"\r\n" = [13, 10]
     &body[2..]
 }
 
 fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
     // Find the position of the first CR in the chunk size
-    let chunk_size_str = match body.iter().position(|&x| x == b'\r') {
-        Some(pos) => &body[..pos],
+    let chunk_pos = match body.iter().position(|&x| x == b'\r') {
+        Some(pos) => pos,
         None => return (0, body), // If no CR found, return 0 size and the original body
     };
 
     // Convert the byte slice to a string, then parse it as a hexadecimal number
-    let chunk_size = match std::str::from_utf8(chunk_size_str) {
+    let chunk_size = match std::str::from_utf8(&body[..chunk_pos]) {
         Ok(s) => match usize::from_str_radix(s, 16) {
             Ok(size) => size,
             Err(_) => return (0, body), // Parsing failed, return 0 size
@@ -71,10 +71,25 @@ fn read_chunk_size(body: &[u8]) -> (usize, &[u8]) {
         Err(_) => return (0, body), // UTF-8 conversion failed, return 0 size
     };
 
-    // Skip the CRLF after the chunk size
-    let rest = skip_crlf(&body[chunk_size_str.len() + 2..]); // Skip the CRLF as well
+    println!(
+        "[debug][read_chunk_size] chunk_size={:?}, chunk_pos={:?}",
+        chunk_size, chunk_pos
+    );
 
-    (chunk_size, rest)
+    // Skip the CRLF after the chunk size
+    let end_of_size = body
+        .windows(2) // Iterate over windows of 2 bytes
+        .position(|window| window == b"\r\n") // Find the position of the "\r\n" sequence
+        .map(|pos| &body[pos..]); // Get a slice starting from the found position
+
+    match end_of_size {
+        Some(slice) => {
+            println!("end_of_size");
+            let rest = skip_crlf(&slice);
+            return (chunk_size, rest);
+        }
+        None => return (chunk_size, body),
+    }
 }
 
 fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
@@ -84,14 +99,23 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
 
     while body_len > 0 {
         let (chunk_size, rest) = read_chunk_size(body);
-        body_len -= rest.as_ptr() as usize - body.as_ptr() as usize;
+        println!("[debug][read_chunked_http_body] body={:?}", body);
+        println!("[debug][read_chunked_http_body] rest={:?}", rest);
+
         body = rest;
+        body_len = rest.len();
 
         if chunk_size == 0 {
             break;
         }
 
         if body_len < chunk_size {
+            println!(
+                "[debug][read_chunked_http_body] remain={:?}, chunk_size=#{:?}, body_len={:?}",
+                chunk_size - body_len,
+                chunk_size,
+                body_len
+            );
             decoded_body.extend_from_slice(&body[..body_len]);
             return Ok(decoded_body);
         }
@@ -101,11 +125,13 @@ fn read_chunked_http_body(body: &[u8]) -> io::Result<Vec<u8>> {
         body_len -= chunk_size;
 
         if body_len < 2 || &body[0..2] != b"\r\n" {
+            println!("[debug] Remain body_len < 2");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Missing CRLF after chunk",
             ));
         }
+        println!("[debug] body={:?}", body);
         body = skip_crlf(body);
         body_len -= 2;
     }
@@ -148,6 +174,7 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
 
     if ret > 0 {
         let body_offset = http_body_offset(buf_slice);
+        println!("body_offset: {:?}", body_offset);
 
         if body_offset == -1 {
             println!("Not HTTP body: {:?}", ssl);
@@ -156,8 +183,6 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
 
         print_buffer(buf as *const c_char, (body_offset - 1) as usize);
 
-        let _body_len = ret - body_offset;
-        let mut _result_body: Vec<u8> = Vec::new();
         let _ = read_chunked_http_body(&buf_slice[body_offset as usize..]);
     }
 
