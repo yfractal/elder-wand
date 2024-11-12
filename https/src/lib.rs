@@ -15,6 +15,7 @@ lazy_static! {
 
 extern "C" {
     fn SSL_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
+    fn SSL_write(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int;
 }
 
 #[repr(C)]
@@ -39,12 +40,24 @@ static __OSX_INTERPOSE_SSL_READ: OsxInterpose = OsxInterpose {
     orig_func: SSL_read as *const fn(*mut c_void, *mut c_void, c_int) -> c_int as *const c_void,
 };
 
+#[link_section = "__DATA,__interpose"]
+#[used]
+static __OSX_INTERPOSE_SSL_WRITE: OsxInterpose = OsxInterpose {
+    new_func: __interpose_SSL_write as *const fn(*mut c_void, *mut c_void, c_int) -> c_int
+        as *const c_void,
+    orig_func: SSL_write as *const fn(*mut c_void, *mut c_void, c_int) -> c_int as *const c_void,
+};
+
 fn real_socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int {
     unsafe { socket(domain, type_, protocol) }
 }
 
 fn real_ssl_read(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int {
     unsafe { SSL_read(ssl, buf, num) }
+}
+
+fn real_ssl_write(ssl: *mut c_void, buf: *mut c_void, num: c_int) -> c_int {
+    unsafe { SSL_write(ssl, buf, num) }
 }
 
 #[no_mangle]
@@ -55,7 +68,7 @@ pub extern "C" fn __interpose_socket(domain: c_int, type_: c_int, protocol: c_in
 }
 
 fn skip_crlf(body: &[u8]) -> &[u8] {
-    assert_eq!(&body[0..2], b"\r\n"); // b"\r\n" = [13, 10]
+    assert_eq!(&body[0..2], b"\r\n"); // b"\r\n" == [13, 10]
     &body[2..]
 }
 
@@ -154,7 +167,7 @@ fn http_body_offset(http_str: &[u8]) -> i32 {
     }
 }
 
-fn print_bytes(buff: &[u8]) {
+fn print_bytes_str(buff: &[u8]) {
     let str = std::str::from_utf8(buff).unwrap();
     println!("{}", str);
 }
@@ -167,6 +180,7 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
         let buf_slice: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
 
         if buf_slice.ends_with(b"0\r\n\r\n") {
+            println!("Reaponse:\n");
             let mut map = GLOBAL_HASHMAP.lock().unwrap();
             let mut buffer = map.get(&(ssl as usize)).unwrap().to_vec();
             buffer.extend(buf_slice);
@@ -180,7 +194,7 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
             }
 
             let header = &buffer[0..body_offset as usize - 1];
-            print_bytes(header);
+            print_bytes_str(header);
 
             match read_chunked_http_body(&buffer[body_offset as usize..]) {
                 Ok(body) => {
@@ -191,7 +205,7 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
                             return ret;
                         }
                     };
-                    print_bytes(&decompressed_output);
+                    print_bytes_str(&decompressed_output);
 
                     return ret;
                 }
@@ -209,6 +223,20 @@ pub extern "C" fn __interpose_SSL_read(ssl: *mut c_void, buf: *mut c_void, num: 
                 map.insert(ssl as usize, buf_slice.to_vec());
             }
         }
+    }
+
+    ret
+}
+
+#[no_mangle]
+pub extern "C" fn __interpose_SSL_write(ssl: *mut c_void, buf: *mut c_void, num: i32) -> i32 {
+    let ret = real_ssl_write(ssl, buf, num);
+
+    if ret > 0 {
+        let buf_slice = unsafe { slice::from_raw_parts(buf as *const u8, ret as usize) };
+
+        println!("Request:\n");
+        print_bytes_str(&buf_slice[0..ret as usize]);
     }
 
     ret
